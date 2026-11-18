@@ -1,0 +1,11 @@
+/data/
+/node_modules/
+/coverage/
+/.playwright-cli/
+.env
+.env.*
+*.log
+*.bak
+*.lnk
+Thumbs.db
+.DS_Store

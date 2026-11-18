@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clash AutoRoute</title>
+  <link rel="stylesheet" href="/panel.css">
+  <script src="/panel.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <a class="brand" href="#routes" aria-label="Clash AutoRoute 首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <span><strong>Clash AutoRoute</strong><small>Clash Verge Rev 本机面板</small></span>
+      </a>
+      <nav aria-label="面板导航">
+        <a href="#routes" aria-current="page">域名分流</a>
+        <a href="#setup">接入设置</a>
+        <a href="#events">运行事件</a>
+      </nav>
+      <button id="refresh" class="secondary refresh" type="button"><span aria-hidden="true">↻</span> 刷新状态</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="connection-alert" class="notice error" role="status" hidden></div>
+
+    <section id="routes" aria-labelledby="routes-title">
+      <div class="page-head">
+        <div>
+          <h1 id="routes-title" tabindex="-1">域名分流</h1>
+          <p>查看自动选出的出口，把常用域名锁定到指定节点。</p>
+        </div>
+        <button id="pause" class="secondary" type="button" disabled>暂停自动分配</button>
+      </div>
+
+      <section class="connection" aria-labelledby="route-state">
+        <div class="connection-copy">
+          <div class="connection-label"><span id="route-light" class="light" data-tone="neutral"></span> 接入状态</div>
+          <h2 id="route-state">正在连接面板</h2>
+          <p id="route-note">正在读取本机服务状态。</p>
+          <a id="route-next" class="connection-link" href="#setup">查看接入设置 <span aria-hidden="true">›</span></a>
+        </div>
+        <ol class="connection-steps" aria-label="当前接入进度">
+          <li>
+            <span id="core-step" class="step-icon" data-tone="neutral" aria-hidden="true">1</span>
+            <strong>Clash 内核</strong>
+            <span id="core-state">检查中</span>
+          </li>
+          <li>
+            <span id="script-step" class="step-icon" data-tone="neutral" aria-hidden="true">2</span>
+            <strong>扩展脚本</strong>
+            <span id="script-state">检查中</span>
+          </li>
+          <li>
+            <span id="hook-step" class="step-icon" data-tone="neutral" aria-hidden="true">3</span>
+            <strong>自动分配</strong>
+            <span id="hook-state">检查中</span>
+          </li>
+        </ol>
+      </section>
+
+      <dl class="summary" aria-label="分流概况">
+        <div><dt>域名记录</dt><dd id="total" class="number">—</dd><dd id="total-note" class="summary-note">等待同步</dd></div>
+        <div><dt>目标代理组</dt><dd id="group">—</dd><dd id="group-note" class="summary-note">测速候选出口</dd></div>
+        <div><dt>原兜底出口</dt><dd id="fallback">—</dd><dd class="summary-note">测速失败时使用</dd></div>
+        <div><dt>本次运行收到的连接</dt><dd id="hooked" class="number">—</dd><dd id="hooked-note" class="summary-note">首连由 AutoRoute 处理</dd></div>
+      </dl>
+
+      <section class="surface records" aria-labelledby="records-title">
+        <div class="surface-head">
+          <div>
+            <h2 id="records-title">域名记录</h2>
+            <p>自动记录可以复测换节点，锁定记录使用你选定的出口。</p>
+          </div>
+          <div class="actions">
+            <button id="open-export" class="secondary" type="button" disabled>导出规则</button>
+            <button id="open-add" class="primary" type="button" disabled>＋ 添加域名</button>
+          </div>
+        </div>
+        <div class="filters">
+          <label class="search">
+            <span class="sr-only">搜索主域名或出口</span>
+            <input id="search" type="search" placeholder="搜索主域名或出口" autocomplete="off">
+          </label>
+          <label><span class="sr-only">筛选状态</span>
+            <select id="filter-state">
+              <option value="">全部状态</option>
+              <option value="auto">自动</option>
+              <option value="locked">已锁定</option>
+              <option value="invalid">节点失效</option>
+              <option value="excluded">已排除</option>
+            </select>
+          </label>
+          <label><span class="sr-only">筛选出口</span><select id="filter-node"><option value="">全部出口</option></select></label>
+          <span id="visible-count" class="filter-count">—</span>
+        </div>
+        <div id="table-region" class="table-region" hidden>
+          <table role="table">
+            <thead>
+              <tr><th scope="col">主域名</th><th scope="col">当前出口</th><th scope="col">最近延迟</th><th scope="col">分配状态</th><th scope="col" class="end">操作</th></tr>
+            </thead>
+            <tbody id="entries"></tbody>
+          </table>
+        </div>
+        <div id="empty" class="empty">
+          <div class="empty-mark" aria-hidden="true">⌁</div>
+          <strong id="empty-title">正在读取域名记录</strong>
+          <p id="empty-note">连接到本机服务后会显示记录。</p>
+          <button id="clear-filters" class="secondary" type="button" hidden>清除筛选</button>
+        </div>
+      </section>
+    </section>
+
+    <section id="setup" aria-labelledby="setup-title" hidden>
+      <div class="page-head">
+        <div>
+          <h1 id="setup-title" tabindex="-1">接入设置</h1>
+          <p>选好候选出口、写入扩展脚本，再回到 Clash Verge Rev 应用当前订阅。</p>
+        </div>
+        <span id="setup-status" class="tag" data-tone="neutral">检查中</span>
+      </div>
+      <div class="setup-grid">
+        <section class="surface setup-flow" aria-label="接入步骤">
+          <ol class="setup-steps">
+            <li>
+              <span class="step-number" aria-hidden="true">1</span>
+              <div class="step-content">
+                <h2>选择目标代理组</h2>
+                <p>AutoRoute 只在该组显式列出的成员里选出口。</p>
+                <div class="field">
+                  <label class="sr-only" for="target-group">目标代理组</label>
+                  <select id="target-group" disabled><option value="">正在读取代理组</option></select>
+                  <p id="group-help" class="field-note"></p>
+                </div>
+                <button id="reload-groups" class="text-button" type="button">重新读取代理组</button>
+              </div>
+            </li>
+            <li>
+              <span class="step-number" aria-hidden="true">2</span>
+              <div class="step-content">
+                <h2>写入全局扩展脚本 <span id="install-state" class="tag" data-tone="neutral">检查中</span></h2>
+                <p>程序会先备份原脚本，并为所选代理组准备规则文件。</p>
+                <button id="install" class="primary" type="button" disabled>保存并写入扩展脚本</button>
+                <p id="install-feedback" class="field-note" role="status" hidden></p>
+              </div>
+            </li>
+            <li>
+              <span class="step-number" aria-hidden="true">3</span>
+              <div class="step-content">
+                <h2>在 Clash Verge Rev 重新应用</h2>
+                <p>在「订阅」中重新应用当前配置，确认代理模式为「规则」，然后回来检查。</p>
+                <button id="check-setup" class="secondary" type="button">检查接入状态</button>
+                <p id="check-feedback" class="field-note" role="status" hidden></p>
+              </div>
+            </li>
+          </ol>
+        </section>
+
+        <aside class="surface setup-aside" aria-labelledby="routing-title">
+          <h2 id="routing-title">连接走哪条规则？</h2>
+          <dl class="routing-flow">
+            <div><dt>命中原有规则</dt><dd>沿用 Clash Verge 里已有的分流规则。</dd></div>
+            <div><dt>命中 AutoRoute 记录</dt><dd>由 Clash 内核直接走表里的当前出口。</dd></div>
+            <div><dt>首次落到兜底</dt><dd>比较候选出口的延迟。成功后记入域名记录，失败时用原兜底出口。</dd></div>
+          </dl>
+        </aside>
+      </div>
+
+      <details class="surface advanced">
+        <summary>高级设置与移除脚本</summary>
+        <div class="advanced-body">
+          <form id="exclude-form" class="field">
+            <label for="exclude">排除域名</label>
+            <p id="exclude-help" class="field-note">用逗号或换行分隔。排除后停止下发该主域名的 AutoRoute 规则，原有记录会保留。</p>
+            <textarea id="exclude" rows="3" placeholder="例如 example.com" aria-describedby="exclude-help" disabled></textarea>
+            <div><button id="save-exclude" class="secondary" type="submit" disabled>保存排除列表</button></div>
+          </form>
+          <div class="advanced-row">
+            <div><strong>登录 Windows 后自动启动</strong><p class="field-note">通过 Windows 启动文件夹静默运行。</p></div>
+            <label class="check"><input id="autostart" type="checkbox" disabled> 开机自启</label>
+          </div>
+          <details class="script-details">
+            <summary>查看脚本路径和预览</summary>
+            <p id="script-path" class="field-note"></p>
+            <pre id="script-preview"></pre>
+          </details>
+          <div class="advanced-row">
+            <div><strong>移除全局扩展脚本</strong><p class="field-note">移除后回到 Clash Verge 重新应用当前订阅。</p></div>
+            <button id="uninstall" class="danger" type="button" disabled>移除扩展脚本</button>
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <section id="events" aria-labelledby="events-title" hidden>
+      <div class="page-head">
+        <div>
+          <h1 id="events-title" tabindex="-1">运行事件</h1>
+          <p>查看本次启动后的分配、回退和操作记录。历史日志在 <code>data/autoroute.log</code>。</p>
+        </div>
+      </div>
+      <section class="surface event-surface" aria-labelledby="recent-title">
+        <div class="surface-head"><h2 id="recent-title">最近事件</h2><span id="event-count" class="filter-count"></span></div>
+        <ul id="event-list" class="event-list"></ul>
+        <div id="event-empty" class="empty"><strong>暂无事件</strong><p>有新分配或设置变更时，会显示在这里。</p></div>
+      </section>
+    </section>
+  </main>
+
+  <dialog id="add-dialog" aria-labelledby="add-title">
+    <div class="dialog-head">
+      <div><h2 id="add-title">添加域名</h2><p>子域名会归并到主域名，并锁定到你选择的出口。</p></div>
+      <button type="button" class="icon-button" data-close aria-label="关闭">×</button>
+    </div>
+    <form id="add-form" class="dialog-body">
+      <div class="field">
+        <label for="add-domain">域名</label>
+        <input id="add-domain" type="text" required maxlength="253" placeholder="例如 cdn.example.com" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="add-node">出口节点</label>
+        <select id="add-node" required></select>
+      </div>
+      <div class="dialog-actions">
+        <button type="button" class="secondary" data-close>取消</button>
+        <button id="add-submit" type="submit" class="primary">添加并锁定</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="detail-dialog" aria-labelledby="detail-title">
+    <div class="dialog-head">
+      <div><h2 id="detail-title"></h2><p id="detail-note"></p></div>
+      <button type="button" class="icon-button" data-close aria-label="关闭">×</button>
+    </div>
+    <div class="dialog-body">
+      <form id="node-form">
+        <div class="field">
+          <label for="detail-node">选择出口</label>
+          <div class="input-row">
+            <select id="detail-node" required></select>
+            <button id="save-node" type="submit" class="primary">切换并锁定</button>
+          </div>
+        </div>
+      </form>
+      <div class="delay-block">
+        <div class="delay-head"><h3>最近测速结果</h3><button id="retest" type="button" class="secondary">重新测速</button></div>
+        <p id="probe-note" class="field-note"></p>
+        <ul id="delay-list" class="delay-list"></ul>
+      </div>
+      <div class="dialog-actions spread">
+        <button id="delete" type="button" class="danger">删除记录</button>
+        <button id="detail-lock" type="button" class="secondary">锁定出口</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="export-dialog" aria-labelledby="export-title">
+    <div class="dialog-head">
+      <div><h2 id="export-title">导出规则</h2><p>导出原有规则和已锁定的域名规则，用于合并到 Clash 配置。</p></div>
+      <button type="button" class="icon-button" data-close aria-label="关闭">×</button>
+    </div>
+    <div class="dialog-body">
+      <div class="export-summary">
+        <div><strong id="export-count" class="number">0</strong><span>未排除的锁定记录</span></div>
+        <button id="lock-all" type="button" class="secondary" disabled>批量锁定</button>
+      </div>
+      <p class="field-note">导出时会跳过自动、已排除和引用已移除出口的记录。合并前请确认目标配置中存在对应的出口名称。</p>
+      <p id="export-feedback" class="field-note" role="status" hidden></p>
+      <div class="dialog-actions">
+        <button id="save-export" type="button" class="secondary">保存至项目目录</button>
+        <button id="download" type="button" class="primary">下载 YAML</button>
+      </div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>
