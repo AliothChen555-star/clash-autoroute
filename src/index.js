@@ -42,7 +42,6 @@ async function startApp(customCfg) {
   }
 
   await groups.refresh();
-  if (groups.installed) await rules.flush(true).catch((e) => log.warn(`[init] ${e.message}`));
 
   const hook = await startHook(cfg, engine, log);
   const ctx = { cfg, api, store, groups, rules, prober, engine, log, shutdown };
@@ -55,9 +54,9 @@ async function startApp(customCfg) {
     if (syncing) return;
     syncing = true;
     try {
-      const changed = await groups.refresh();
-      if (groups.ok && (changed || (rules.lastError && !rules.running))) {
-        rules.flush(changed).catch((e) => log.warn(`[sync] ${e.message}`));
+      await groups.refresh();
+      if (groups.ok && !rules.running) {
+        rules.flush().catch((e) => log.warn(`[sync] ${e.message}`));
       }
       await engine.watchConnections();
     } catch (e) {
@@ -93,6 +92,8 @@ async function startApp(customCfg) {
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  if (groups.installed) await rules.flush().catch((e) => log.warn(`[init] ${e.message}`));
 
   return ctx;
 }

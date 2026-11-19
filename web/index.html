@@ -128,7 +128,7 @@
               <span class="step-number" aria-hidden="true">1</span>
               <div class="step-content">
                 <h2>选择目标代理组</h2>
-                <p>AutoRoute 只在该组显式列出的成员里选出口。</p>
+                <p>AutoRoute 会同时测试该组的成员和 DIRECT（直连）。</p>
                 <div class="field">
                   <label class="sr-only" for="target-group">目标代理组</label>
                   <select id="target-group" disabled><option value="">正在读取代理组</option></select>
@@ -162,6 +162,7 @@
           <h2 id="routing-title">连接走哪条规则？</h2>
           <dl class="routing-flow">
             <div><dt>命中原有规则</dt><dd>沿用 Clash Verge 里已有的分流规则。</dd></div>
+            <div><dt>识别为中国大陆流量</dt><dd>按 Clash 的 GeoSite 和 GeoIP 数据走直连。</dd></div>
             <div><dt>命中 AutoRoute 记录</dt><dd>由 Clash 内核直接走表里的当前出口。</dd></div>
             <div><dt>首次落到兜底</dt><dd>比较候选出口的延迟。成功后记入域名记录，失败时用原兜底出口。</dd></div>
           </dl>

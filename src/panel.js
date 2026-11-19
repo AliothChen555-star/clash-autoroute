@@ -5,6 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const { ROOT, DATA_DIR, save: saveConfig } = require('./config');
 const { cleanDomain, mainDomain, isExcluded } = require('./domain');
+const { PROVIDER_RE } = require('./groups');
+const { RULE_LIST_PATH } = require('./rules');
 const exporter = require('./exporter');
 const vergeScript = require('./verge-script');
 const autostart = require('./autostart');
@@ -72,8 +74,10 @@ function startPanel(ctx) {
       fallbackTarget: groups.fallbackTarget,
       fallbackNow: groups.fallbackNow,
       fallbackRuleActive: groups.fallbackRuleActive,
+      directChina: cfg.directChina !== false,
+      chinaRules: groups.chinaRules,
       ruleError: rules.lastError,
-      ruleSyncing: Boolean(rules.running),
+      ruleSyncing: Boolean(rules.timer || rules.running),
       nodes: [...groups.mapping].map(([name, port]) => ({ name, port })),
       counts: {
         total: list.length,
@@ -99,6 +103,18 @@ function startPanel(ctx) {
     if (m === 'GET' && assets.has(p)) {
       const [file, type] = assets.get(p);
       return send(res, 200, fs.readFileSync(path.join(ROOT, 'web', file)), `${type}; charset=utf-8`);
+    }
+    if (m === 'GET' && p.startsWith(RULE_LIST_PATH)) {
+      const name = p.slice(RULE_LIST_PATH.length);
+      if (PROVIDER_RE.test(name)) {
+        try {
+          const content = fs.readFileSync(rules.fileOfProvider(name));
+          return send(res, 200, content, 'text/plain; charset=utf-8');
+        } catch (e) {
+          if (e.code !== 'ENOENT') throw e;
+        }
+      }
+      return send(res, 404, { error: '规则集文件不存在' });
     }
     if (m === 'GET' && p === '/api/status') return send(res, 200, status());
     if (m === 'GET' && p === '/api/entries') {
@@ -127,16 +143,7 @@ function startPanel(ctx) {
       }
     }
     if (m === 'POST' && p === '/api/lock-all') {
-      let n = 0;
-      for (const e of store.list()) {
-        if (e.state === 'auto' && groups.portOf(e.node) && !isExcluded(cfg, e.domain)) {
-          e.state = 'locked';
-          n++;
-        }
-      }
-      store.save();
-      engine.event('lock', `批量锁定 ${n} 个条目`);
-      return send(res, 200, { locked: n });
+      return send(res, 200, { locked: engine.lockAll() });
     }
     if (m === 'POST' && p === '/api/pause') {
       engine.paused = true;
@@ -185,16 +192,18 @@ function startPanel(ctx) {
       return send(res, 200, publicConfig());
     }
     if (m === 'GET' && p === '/api/verge-script') {
+      let runtime;
       let members;
       try {
-        members = vergeScript.runtimeMembers(cfg);
+        runtime = vergeScript.readRuntimeConfig(cfg);
+        members = vergeScript.runtimeMembers(cfg, runtime);
       } catch {
         // 等 Clash 应用订阅后再读取实际成员，路径和基础预览仍可展示。
       }
       return send(res, 200, {
         file: vergeScript.globalScriptFile(cfg),
         installed: Boolean(vergeScript.installedConfig(cfg)),
-        block: vergeScript.renderBlock(cfg, members),
+        block: vergeScript.renderBlock(cfg, members, runtime),
       });
     }
     if (m === 'POST' && p === '/api/verge-script/install') {
@@ -222,9 +231,9 @@ function startPanel(ctx) {
       return send(res, 200, { autostart: autostart.isEnabled() });
     }
     if (m === 'POST' && p === '/api/refresh') {
-      const changed = await groups.refresh();
-      if (groups.ok && groups.installed && (changed || rules.lastError) && !rules.running) {
-        await rules.flush(changed);
+      await groups.refresh();
+      if (groups.ok) {
+        await rules.flush().catch((e) => log.warn(`[sync] ${e.message}`));
       }
       return send(res, 200, status());
     }

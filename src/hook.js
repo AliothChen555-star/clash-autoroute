@@ -4,6 +4,8 @@ const net = require('net');
 const { acceptSocks, socksConnect, reply } = require('./socks');
 const { healthHost } = require('./config');
 
+const LOCAL_HANDSHAKE_TIMEOUT_MS = 500;
+
 function startHook(cfg, engine, log) {
   const hHost = healthHost(cfg);
   let active = 0;
@@ -33,18 +35,45 @@ function startHook(cfg, engine, log) {
   });
 
   async function handle(s, host, port, rest) {
-    const r = await engine.route(host, port);
-    if (s.destroyed) return;
+    const abort = new AbortController();
+    const onClose = () => abort.abort();
+    s.once('close', onClose);
+    try {
+      const route = await engine.route(host, port, abort.signal);
+      if (!route) return;
+      await forward(s, route, host, port, rest, abort.signal);
+    } finally {
+      s.removeListener('close', onClose);
+    }
+  }
+
+  async function connect(route, host, port, signal) {
+    const timeout = route.finish || route.port === cfg.listenerBase ? LOCAL_HANDSHAKE_TIMEOUT_MS : undefined;
+    try {
+      const socket = await socksConnect(route.port, host, port, timeout, signal);
+      return socket.destroyed ? null : socket;
+    } catch (e) {
+      if (!signal.aborted) log.warn(`[hook] ${host}:${port} 经 ${route.node || '原出口'}(端口 ${route.port}) 连接失败：${e.message}`);
+      return null;
+    }
+  }
+
+  async function forward(s, route, host, port, rest, signal) {
     let up;
     try {
-      up = await socksConnect(r.port, host, port);
-    } catch (e) {
-      log.warn(`[hook] ${host}:${port} 经 ${r.node || '原出口'}(端口 ${r.port}) 连接失败：${e.message}`);
-      if (!s.destroyed) s.end(reply(0x05));
-      return;
+      if (!s.destroyed) up = await connect(route, host, port, signal);
+    } finally {
+      route.finish?.(Boolean(up && !s.destroyed));
+    }
+    if (!up && route.finish && !s.destroyed && route.port !== cfg.listenerBase) {
+      up = await connect(engine.fallback('首选握手失败'), host, port, signal);
     }
     if (s.destroyed) {
-      up.destroy();
+      up?.destroy();
+      return;
+    }
+    if (!up) {
+      s.end(reply(0x05));
       return;
     }
     up.on('error', () => s.destroy());

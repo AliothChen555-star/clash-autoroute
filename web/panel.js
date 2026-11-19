@@ -86,6 +86,17 @@ async function act(button, work, errorLabel) {
   }
 }
 
+function chinaDirectStatus(s) {
+  const loaded = s.chinaRules || [];
+  if (!s.directChina) return loaded.length ? '大陆直连规则仍在运行。重写脚本并重新应用订阅后关闭。' : '';
+  if (loaded.length === 2) return '识别到的中国大陆域名和 IP 走直连。';
+  if (loaded.length === 1) {
+    const kind = loaded[0] === 'domain' ? '域名' : 'IP';
+    return '大陆直连当前仅按' + kind + '识别。补齐 Clash 的 GEO 数据后可重新写入脚本。';
+  }
+  return '大陆直连规则未加载。确认 Clash 的 GEO 数据可用后，重写脚本并重新应用订阅。';
+}
+
 function presentation(s) {
   if (!s) return ['neutral', '正在连接面板', '正在读取本机服务状态。'];
   if (!state.online) return ['bad', '本机面板连接中断', '请确认 Clash AutoRoute 正在运行，再刷新状态。'];
@@ -108,12 +119,16 @@ function presentation(s) {
   }
   if (s.ruleError) return ['bad', '规则集同步失败', s.ruleError + '。服务会自动重试。'];
   if (s.ruleSyncing) return ['neutral', '正在同步规则集', '同步完成后面板会自动更新状态。'];
-  if (s.paused) return ['warn', '自动分配已暂停', '新域名暂走原兜底出口，已下发的分流规则继续匹配。'];
+  if (s.paused) return ['warn', '自动分配已暂停', '走到兜底的新域名使用原出口。已下发的规则继续匹配。'];
   if (s.fallbackNow !== 'AutoRoute-Hook') {
     const headline = s.fallbackNow ? 'Clash 目前选用原兜底出口。' : '还未读到 Clash 兜底组当前选择。';
     return ['warn', '等待自动分配接管', headline + '请刷新状态，或等待 Clash 完成下一次健康检查。'];
   }
-  return ['good', '自动分配就绪', '访问一个会落到原兜底规则的新网站，测速成功后就能在下面看到域名和出口。'];
+  if (!s.nodes.some((node) => node.name === 'DIRECT')) {
+    return ['good', '自动分配就绪', '直连尚未加入测速。请确认节点端口有空余，并重写扩展脚本、重新应用订阅。'];
+  }
+  const direct = chinaDirectStatus(s);
+  return ['good', '自动分配就绪', direct || '访问一个会落到原兜底规则的新网站，测速成功后就能在下面看到域名和出口。'];
 }
 
 function checkedStep(id, textId, label, tone, index) {
@@ -153,7 +168,8 @@ function renderStatus() {
   setText('group', s.targetGroup || '未选择');
   $('group').title = s.targetGroup || '';
   const visibleGroup = s.scriptGroup && s.scriptGroup !== s.targetGroup ? '已写入 ' + s.scriptGroup : '';
-  setText('group-note', visibleGroup || (s.controllerOk && s.scriptMatches ? s.nodes.length + ' 个候选出口' : '等待脚本生效'));
+  const candidates = s.nodes.length + ' 个测速候选' + (s.nodes.some((node) => node.name === 'DIRECT') ? '，含直连' : '');
+  setText('group-note', visibleGroup || (s.controllerOk && s.scriptMatches ? candidates : '等待脚本生效'));
   if (s.fallbackTarget) setText('fallback', s.fallbackTarget);
   else setText('fallback', '待接入');
   $('fallback').title = s.fallbackTarget || '';
@@ -164,12 +180,16 @@ function renderStatus() {
   if (!$('autostart').dataset.busy) $('autostart').checked = s.autostart;
 }
 
+function outletName(name) {
+  return name === 'DIRECT' ? 'DIRECT（直连）' : name;
+}
+
 function selectOptions(element, items, placeholder, selected = element.value) {
   const key = JSON.stringify([items, placeholder]);
   if (element.dataset.options !== key) {
     const options = placeholder === null ? [] : [new Option(placeholder, '')];
     for (const item of items) {
-      const option = new Option(item.label || item.name, item.name);
+      const option = new Option(item.label || outletName(item.name), item.name);
       option.disabled = Boolean(item.disabled);
       options.push(option);
     }
@@ -286,7 +306,7 @@ function entryTag(entry) {
 
 function entryRow(entry) {
   const domain = escapeText(entry.domain);
-  const node = escapeText(entry.node);
+  const node = escapeText(outletName(entry.node));
   const tag = entryTag(entry);
   const locked = entry.state === 'locked';
   const hits = Number.isFinite(entry.hits) ? entry.hits : 0;
@@ -315,7 +335,7 @@ function renderEntries(force = false) {
   const filtered = Boolean(search || filter || node);
   const visible = state.entries.filter((entry) => {
     if (node && entry.node !== node) return false;
-    if (search && !entry.domain.toLowerCase().includes(search) && !entry.node.toLowerCase().includes(search)) return false;
+    if (search && !entry.domain.toLowerCase().includes(search) && !outletName(entry.node).toLowerCase().includes(search)) return false;
     if (filter === 'excluded') return entry.excluded;
     if (filter === 'invalid') return entryTag(entry).label === '节点失效';
     return !filter || entry.state === filter;
@@ -451,7 +471,7 @@ function renderDetail() {
   $('node-form').hidden = false;
   const label = entryTag(entry).label;
   setText('detail-title', entry.domain);
-  setText('detail-note', (entry.excluded || !entry.valid ? '保存的出口 ' : '当前出口 ') + entry.node + ' / ' + label);
+  setText('detail-note', (entry.excluded || !entry.valid ? '保存的出口 ' : '当前出口 ') + outletName(entry.node) + ' / ' + label);
   setText('detail-lock', entry.state === 'locked' ? '解锁出口' : '锁定出口');
   const selected = state.detailNodeDirty ? $('detail-node').value : entry.node;
   selectOptions($('detail-node'), state.status?.nodes || [], '选择出口', selected);
@@ -462,12 +482,12 @@ function renderDetail() {
     const lastTest = new Date(entry.testedAt).toLocaleString('zh-CN', { hour12: false });
     setText('probe-note', '测试主机 ' + probe + ' / ' + lastTest);
   } else {
-    setText('probe-note', '暂无测速结果。点击「重新测速」查看各出口延迟。');
+    setText('probe-note', '点击「重新测速」比较各出口和直连的延迟。');
   }
 
   const html = delays.map(([node, delay]) => {
     const current = node === entry.node;
-    return '<li' + (current ? ' class="current"' : '') + '><span>' + escapeText(node)
+    return '<li' + (current ? ' class="current"' : '') + '><span>' + escapeText(outletName(node))
       + (current ? ' <small>已选</small>' : '') + '</span><span class="latency">'
       + (Number.isFinite(delay) ? delay + ' <span>ms</span>' : '<span>未测通</span>') + '</span></li>';
   }).join('');
@@ -497,7 +517,7 @@ async function checkConnection(button, inSetup = false) {
     await refreshAfterAction();
     if (inSetup) {
       const [tone, title, detail] = presentation(status);
-      note('check-feedback', tone === 'good' ? title + '。到「域名分流」查看记录。' : title + '。' + detail, tone);
+      note('check-feedback', title + '。' + detail, tone);
       if (!state.groupOptions.length && status.controllerOk) await loadSetup();
     } else {
       const [tone, title] = presentation(status);

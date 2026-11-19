@@ -3,7 +3,7 @@
 // 映射以扩展脚本注入的规则 `RULE-SET,autoroute-p<端口>-<节点标识>,<节点>` 为准，
 // 因此插件无需重算端口，也不会因组成员顺序差异而错位。
 
-const PROVIDER_RE = /^autoroute-p(\d+)(?:-[a-f0-9]{16})?$/;
+const PROVIDER_RE = /^autoroute-p(\d{1,5})(?:-[a-f0-9]{16})?$/;
 const REVISION_RE = /^AutoRoute-UDP-([a-f0-9]+)$/;
 
 class Groups {
@@ -16,6 +16,7 @@ class Groups {
     this.fallbackTarget = null;
     this.fallbackNow = null;
     this.fallbackRuleActive = false;
+    this.chinaRules = [];
     this.revision = null;
     this.mode = null;
     this.ok = false; // 能否连上内核
@@ -28,7 +29,7 @@ class Groups {
     return this.mapping.size > 0;
   }
 
-  nodes() {
+  autoNodes() {
     return [...this.mapping.keys()];
   }
 
@@ -53,15 +54,24 @@ class Groups {
       ]);
       const next = new Map();
       const providers = new Map();
+      const chinaRules = new Set();
+      let firstMatch = null;
       let revision = null;
       const rules = j?.rules || [];
       for (const r of rules) {
+        if (r.extra?.disabled) continue;
+        if (r.type === 'Match' && !firstMatch) firstMatch = r;
+        if (!firstMatch && r.proxy === 'AutoRoute-Direct' && String(r.payload).toLowerCase() === 'cn') {
+          if (r.type === 'GeoSite') chinaRules.add('domain');
+          if (r.type === 'GeoIP') chinaRules.add('ip');
+        }
         if (r.type === 'Network') revision = REVISION_RE.exec(r.proxy || '')?.[1] || revision;
         if (r.type !== 'RuleSet') continue;
         const m = PROVIDER_RE.exec(r.payload || '');
         if (m) {
           const port = Number(m[1]);
-          next.set(r.proxy, port);
+          const node = r.proxy === 'AutoRoute-Direct' ? 'DIRECT' : r.proxy;
+          next.set(node, port);
           providers.set(port, r.payload);
         }
       }
@@ -76,12 +86,14 @@ class Groups {
           fb = null;
         }
       }
-      const changed = !this.ok || revision !== this.revision || !sameMap(next, this.mapping) || !sameMap(providers, this.providers);
+      const changed = !this.ok || revision !== this.revision ||
+        !sameMap(next, this.mapping) || !sameMap(providers, this.providers);
       this.mapping = next;
       this.providers = providers;
       this.fallbackTarget = fb;
       this.fallbackNow = active;
-      this.fallbackRuleActive = rules.find((r) => r.type === 'Match' && !r.extra?.disabled)?.proxy === 'AutoRoute-Fallback';
+      this.fallbackRuleActive = firstMatch?.proxy === 'AutoRoute-Fallback';
+      this.chinaRules = [...chinaRules];
       this.revision = revision;
       this.mode = config?.mode?.toLowerCase() || null;
       this.ok = true;
@@ -117,4 +129,4 @@ function sameMap(a, b) {
   return true;
 }
 
-module.exports = { Groups };
+module.exports = { Groups, PROVIDER_RE };

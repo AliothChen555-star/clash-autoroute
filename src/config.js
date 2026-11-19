@@ -10,6 +10,8 @@ const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const DEFAULTS = {
   // 参与竞速的代理组（其直接成员即候选节点）
   targetGroup: '',
+  // 现有规则未命中时，使用 mihomo 的 GEO 数据让中国大陆流量直连
+  directChina: true,
   // 插件端口
   panelPort: 7898, // 本地面板
   hookPort: 7899, // mihomo 的 AutoRoute-Hook(socks5) 指向这里

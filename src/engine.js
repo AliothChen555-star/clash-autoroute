@@ -3,11 +3,25 @@
 const { mainDomain, isExcluded } = require('./domain');
 const { pickBest } = require('./prober');
 
+const DECISION_TIMEOUT_MS = 3500;
+
+function waitForDecision(decision, signal) {
+  if (signal?.aborted) return Promise.resolve(undefined);
+  let stop;
+  const deadline = new Promise((resolve) => { stop = () => resolve(undefined); });
+  const timer = setTimeout(stop, DECISION_TIMEOUT_MS);
+  signal?.addEventListener('abort', stop, { once: true });
+  return Promise.race([decision, deadline]).finally(() => {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', stop);
+  });
+}
+
 class Engine {
   constructor({ cfg, api, store, groups, rules, prober, log }) {
     Object.assign(this, { cfg, api, store, groups, rules, prober, log });
     this.paused = false;
-    this.inflight = new Map(); // domain -> Promise<entry|null>
+    this.measurements = new Map(); // domain -> 当前允许提交结果的测速批次
     this.failCache = new Map(); // domain -> until(ms)
     this.events = [];
     this.stats = { hooked: 0, assigned: 0, fallback: 0, startedAt: Date.now() };
@@ -27,58 +41,113 @@ class Engine {
   }
 
   /** Hook 收到的每个连接：返回应交给哪个 listener 端口 */
-  async route(host, port) {
+  async route(host, port, signal) {
     this.stats.hooked++;
     const domain = mainDomain(host);
     if (!domain) return this.fallback('无域名');
     if (this.paused) return this.fallback('已暂停');
     if (isExcluded(this.cfg, domain)) return this.fallback('排除列表');
 
-    const e = this.store.get(domain);
-    if (e) {
-      const p = this.groups.portOf(e.node);
-      if (p) {
-        // 规则集刷新前的短暂窗口里，同域名连接仍会到这里
-        e.lastSeen = Date.now();
-        return { port: p, node: e.node, reason: '已分配' };
+    const existing = this.existingRoute(domain);
+    if (existing) return existing;
+    if (this.failCache.get(domain) > Date.now()) return this.fallback('近期测速失败');
+
+    let batch = this.measurements.get(domain);
+    if (batch?.kind !== 'initial' || batch.version !== this.groups.version) {
+      const nodes = this.groups.autoNodes();
+      if (!nodes.length) return this.fallback('没有可用节点');
+      batch = this.startAssignment(domain, host, port, nodes);
+    }
+    batch.waiters++;
+    let handedOff = false;
+    try {
+      const best = await waitForDecision(batch.decision, signal);
+      if (signal?.aborted) return null;
+      if (this.paused) return this.fallback('已暂停');
+      if (isExcluded(this.cfg, domain)) return this.fallback('排除列表');
+      const current = this.existingRoute(domain);
+      if (current) return current;
+      if (!this.isCurrent(domain, batch)) return this.fallback('测速期间设置已变更');
+      if (best === undefined) return this.fallback('等待测速超时');
+      if (!best) {
+        if (!batch.reportedFailure) {
+          batch.reportedFailure = true;
+          this.failCache.set(domain, Date.now() + this.cfg.failCacheMinutes * 60e3);
+          this.event('fail', `${domain}：所有节点测速失败，暂走原出口`);
+        }
+        return this.fallback('测速失败');
       }
-      if (e.state === 'locked') return this.fallback(`锁定节点 ${e.node} 不可用`);
-      this.store.delete(domain);
-      this.event('stale', `${domain}：原节点 ${e.node} 已不在组内，重新测速`);
+      const outlet = this.groups.portOf(best.node);
+      if (!outlet) return this.fallback('节点已变更');
+      handedOff = true;
+      return {
+        port: outlet,
+        node: best.node,
+        reason: '首连候选',
+        finish: (connected) => {
+          try {
+            if (connected) this.confirmAssignment(domain, batch, best, outlet);
+          } finally {
+            this.releaseAssignment(domain, batch);
+          }
+        },
+      };
+    } finally {
+      if (!handedOff) this.releaseAssignment(domain, batch);
     }
-
-    const until = this.failCache.get(domain);
-    if (until && until > Date.now()) return this.fallback('近期测速失败');
-
-    let pr = this.inflight.get(domain);
-    if (!pr) {
-      pr = this.assign(domain, host, port).finally(() => this.inflight.delete(domain));
-      this.inflight.set(domain, pr);
-    }
-    const r = await pr;
-    if (r) {
-      const p = this.groups.portOf(r.node);
-      if (p) return { port: p, node: r.node, reason: '新分配' };
-    }
-    return this.fallback('测速失败');
   }
 
-  async assign(domain, host, port) {
-    const nodes = this.groups.nodes();
-    if (!nodes.length) return null;
-    const version = this.groups.version;
-    const t0 = Date.now();
-    const { decision, all } = this.prober.probe(host, port, nodes, true);
-    const best = await decision;
-    if (this.paused || isExcluded(this.cfg, domain)) return null;
-    const current = this.store.get(domain);
-    if (current) return current; // 测速等待期间用户可能已经手动选定出口
-    if (version !== this.groups.version) return null;
-    if (!best) {
-      this.failCache.set(domain, Date.now() + this.cfg.failCacheMinutes * 60e3);
-      this.event('fail', `${domain}：所有节点测速失败，暂走原出口`);
-      return null;
+  existingRoute(domain) {
+    const entry = this.store.get(domain);
+    if (!entry) return null;
+    const port = this.groups.portOf(entry.node);
+    if (port) {
+      // 规则集刷新前的短暂窗口里，同域名连接仍会到这里
+      entry.lastSeen = Date.now();
+      return { port, node: entry.node, reason: '已分配' };
     }
+    if (entry.state === 'locked') return this.fallback(`锁定节点 ${entry.node} 不可用`);
+    this.store.delete(domain);
+    this.measurements.delete(domain);
+    this.event('stale', `${domain}：原节点 ${entry.node} 已不在组内，重新测速`);
+    return null;
+  }
+
+  startAssignment(domain, host, port, nodes) {
+    const startedAt = Date.now();
+    const { decision, all } = this.prober.probe(host, port, nodes, true);
+    const batch = { kind: 'initial', version: this.groups.version, host, startedAt, decision,
+      hasDirect: nodes.includes('DIRECT'), waiters: 0, complete: false };
+    this.measurements.set(domain, batch);
+    all.then((delays) => {
+      batch.delays = delays;
+      if (batch.entry) this.finishInitialDelays(domain, batch);
+    }).catch((e) => {
+      this.log.warn(`[probe] ${domain}：${e.message}`);
+    }).finally(() => {
+      batch.complete = true;
+      this.cleanupAssignment(domain, batch);
+    });
+    return batch;
+  }
+
+  isCurrent(domain, batch) {
+    return this.measurements.get(domain) === batch && this.groups.version === batch.version && !isExcluded(this.cfg, domain);
+  }
+
+  releaseAssignment(domain, batch) {
+    batch.waiters--;
+    this.cleanupAssignment(domain, batch);
+  }
+
+  cleanupAssignment(domain, batch) {
+    if (batch.complete && batch.waiters === 0 && this.measurements.get(domain) === batch) {
+      this.measurements.delete(domain);
+    }
+  }
+
+  confirmAssignment(domain, batch, best, port) {
+    if (!this.isCurrent(domain, batch) || this.paused || this.store.get(domain) || this.groups.portOf(best.node) !== port) return;
     const now = Date.now();
     const entry = {
       domain,
@@ -86,34 +155,37 @@ class Engine {
       delay: best.delay,
       state: this.cfg.autoLock ? 'locked' : 'auto',
       delays: best.delays,
-      sampleHost: host,
+      sampleHost: batch.host,
       createdAt: now,
       testedAt: now,
+      testedWithDirect: batch.hasDirect && Object.hasOwn(best.delays, 'DIRECT'),
       lastSeen: now,
       hits: 1,
     };
+    batch.entry = entry;
     this.store.set(entry);
     this.failCache.delete(domain);
     this.rules.schedule();
     this.stats.assigned++;
-    this.event('assign', `${domain} → ${best.node}（${best.delay}ms，等待 ${now - t0}ms）`);
+    this.event('assign', `${domain} → ${best.node}（${best.delay}ms，等待 ${now - batch.startedAt}ms）`);
+    if (batch.delays) this.finishInitialDelays(domain, batch);
+  }
 
-    // 其余节点测完后补全延迟表；若后到结果明显更快（unified-delay 下可能出现），自动模式下修正
-    all.then((delays) => {
-      const cur = this.store.get(domain);
-      if (cur !== entry || version !== this.groups.version || isExcluded(this.cfg, domain)) return;
-      cur.delays = delays;
-      const b = pickBest(delays);
-      if (typeof delays[cur.node] === 'number') cur.delay = delays[cur.node];
-      if (!this.paused && cur.state === 'auto' && b && b.node !== cur.node && this.shouldSwitch(cur.delay, b.delay)) {
-        this.event('switch', `${domain}：${cur.node} → ${b.node}（${cur.delay}ms → ${b.delay}ms）`);
-        cur.node = b.node;
-        cur.delay = b.delay;
-        this.rules.schedule();
-      }
-      this.store.save();
-    });
-    return entry;
+  finishInitialDelays(domain, batch) {
+    const cur = this.store.get(domain);
+    if (cur !== batch.entry || !this.isCurrent(domain, batch)) return;
+    const delays = batch.delays;
+    cur.delays = delays;
+    cur.testedWithDirect = batch.hasDirect;
+    const best = pickBest(delays);
+    if (typeof delays[cur.node] === 'number') cur.delay = delays[cur.node];
+    if (!this.paused && cur.state === 'auto' && best && best.node !== cur.node && this.shouldSwitch(cur.delay, best.delay)) {
+      this.event('switch', `${domain}：${cur.node} → ${best.node}（${cur.delay}ms → ${best.delay}ms）`);
+      cur.node = best.node;
+      cur.delay = best.delay;
+      this.rules.schedule();
+    }
+    this.store.save();
   }
 
   shouldSwitch(curDelay, newDelay) {
@@ -124,23 +196,43 @@ class Engine {
 
   /** 完整重测一个域名；manual=true 时锁定条目也会测，但不会自动改节点 */
   async retest(domain, manual = false) {
+    const active = this.measurements.get(domain);
+    if (active && !manual) return;
     const e = this.store.get(domain);
     if (!e) throw new Error('条目不存在');
     if (isExcluded(this.cfg, domain)) throw new Error('域名已排除，请先在接入设置中解除排除');
-    const nodes = this.groups.nodes();
+    const nodes = this.groups.autoNodes();
     if (!nodes.length) throw new Error('没有可用节点（扩展脚本未生效？）');
-    const version = this.groups.version;
-    const { all } = this.prober.probe(e.sampleHost || domain, 443, nodes, false);
+    if (active?.kind === 'manual' && active.entry === e && this.isCurrent(domain, active)) return active.result;
+    const batch = { kind: manual ? 'manual' : 'background', entry: e, version: this.groups.version };
+    this.measurements.set(domain, batch);
+    try {
+      batch.result = this.finishRetest(domain, batch, nodes, manual);
+      return await batch.result;
+    } finally {
+      if (this.measurements.get(domain) === batch) this.measurements.delete(domain);
+    }
+  }
+
+  async finishRetest(domain, batch, nodes, manual) {
+    const e = batch.entry;
+    const candidates = manual && !nodes.includes('DIRECT') ? [...nodes, 'DIRECT'] : nodes;
+    const { all } = this.prober.probe(e.sampleHost || domain, 443, candidates, false);
     const delays = await all;
     const cur = this.store.get(domain);
-    if (cur !== e || version !== this.groups.version || isExcluded(this.cfg, domain)) {
-      throw new Error('条目或代理组已变更，请重新测速');
+    if (cur !== e || !this.isCurrent(domain, batch)) {
+      if (manual) throw new Error('条目或代理组已变更，请重新测速');
+      return;
     }
     cur.delays = delays;
     cur.testedAt = Date.now();
+    cur.testedWithDirect = nodes.includes('DIRECT');
     cur.delay = typeof delays[cur.node] === 'number' ? delays[cur.node] : null;
-    const b = pickBest(delays);
-    if (cur.state === 'auto' && b && b.node !== cur.node && (manual ? b.delay < (cur.delay ?? Infinity) : !this.paused && this.shouldSwitch(cur.delay, b.delay))) {
+    // 旧脚本尚未加载直连入站时，手动测出的 DIRECT 只作为对照。
+    const b = pickBest(Object.fromEntries(nodes.map((node) => [node, delays[node]])));
+    const allowSwitch = b && (manual ? !nodes.includes(cur.node) || b.delay < (cur.delay ?? Infinity)
+      : !this.paused && this.shouldSwitch(cur.delay, b.delay));
+    if (cur.state === 'auto' && b && b.node !== cur.node && allowSwitch) {
       this.event('switch', `${domain}：${cur.node} → ${b.node}（${cur.delay ?? '超时'} → ${b.delay}ms，${manual ? '手动重测' : '定期复测'}）`);
       cur.node = b.node;
       cur.delay = b.delay;
@@ -150,20 +242,22 @@ class Engine {
     return cur;
   }
 
-  /** 定期复测：自动条目、超过 retestHours 未测、近期仍在使用 */
+  /** 定期复测近期活跃的自动条目，并补测旧记录新增的直连候选 */
   async retestCycle(limit = 5) {
     if (this.retesting || this.paused || !this.groups.installed) return;
     this.retesting = true;
     try {
       const now = Date.now();
+      const hasDirect = Boolean(this.groups.portOf('DIRECT'));
       const due = this.store
         .list()
         .filter(
           (e) =>
             e.state === 'auto' &&
+            !this.measurements.has(e.domain) &&
             !isExcluded(this.cfg, e.domain) &&
             this.groups.portOf(e.node) &&
-            now - (e.testedAt || 0) > this.cfg.retestHours * 3600e3 &&
+            ((hasDirect && !e.testedWithDirect) || now - (e.testedAt || 0) > this.cfg.retestHours * 3600e3) &&
             now - (e.lastSeen || 0) < this.cfg.retestActiveDays * 86400e3,
         )
         .sort((a, b) => (a.testedAt || 0) - (b.testedAt || 0))
@@ -187,6 +281,7 @@ class Engine {
     for (const e of this.store.list()) {
       if (e.state === 'auto' && now - (e.lastSeen || e.createdAt || 0) > this.cfg.expireDays * 86400e3) {
         this.store.delete(e.domain);
+        this.measurements.delete(e.domain);
         n++;
       }
     }
@@ -227,10 +322,24 @@ class Engine {
   setState(domain, state) {
     const e = this.store.get(domain);
     if (!e) throw new Error('条目不存在');
+    this.measurements.delete(domain);
     e.state = state;
     this.store.save();
     this.event(state === 'locked' ? 'lock' : 'unlock', `${domain}：${state === 'locked' ? '已锁定' : '已解锁'}（${e.node}）`);
     return e;
+  }
+
+  lockAll() {
+    let count = 0;
+    for (const e of this.store.list()) {
+      if (e.state !== 'auto' || !this.groups.portOf(e.node) || isExcluded(this.cfg, e.domain)) continue;
+      this.measurements.delete(e.domain);
+      e.state = 'locked';
+      count++;
+    }
+    if (count) this.store.save();
+    this.event('lock', `批量锁定 ${count} 个条目`);
+    return count;
   }
 
   setNode(domain, node, lock = true) {
@@ -245,6 +354,7 @@ class Engine {
     e.delay = e.delays && typeof e.delays[node] === 'number' ? e.delays[node] : null;
     if (lock) e.state = 'locked';
     else e.state = e.state || 'auto';
+    this.measurements.delete(domain);
     this.store.set(e);
     this.failCache.delete(domain);
     this.rules.schedule();
@@ -253,6 +363,7 @@ class Engine {
   }
 
   remove(domain) {
+    this.measurements.delete(domain);
     const ok = this.store.delete(domain);
     if (ok) {
       this.rules.schedule();

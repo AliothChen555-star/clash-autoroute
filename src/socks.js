@@ -72,8 +72,9 @@ function acceptSocks(sock, onRequest) {
 }
 
 /** 通过本机 SOCKS5（mihomo listener）建立到 host:port 的连接 */
-function socksConnect(proxyPort, host, port, timeout = 10000) {
+function socksConnect(proxyPort, host, port, timeout = 10000, signal) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
     const s = net.connect({ host: '127.0.0.1', port: proxyPort });
     s.setNoDelay(true);
     let buf = Buffer.alloc(0);
@@ -83,6 +84,7 @@ function socksConnect(proxyPort, host, port, timeout = 10000) {
       if (done) return;
       done = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       s.removeListener('data', onData);
       if (err) {
         s.destroy();
@@ -91,7 +93,9 @@ function socksConnect(proxyPort, host, port, timeout = 10000) {
         resolve(s);
       }
     };
+    const onAbort = () => finish(signal.reason);
     const timer = setTimeout(() => finish(new Error('socks 超时')), timeout);
+    signal?.addEventListener('abort', onAbort, { once: true });
     s.once('connect', () => s.write(Buffer.from([0x05, 0x01, 0x00])));
     s.on('error', (e) => finish(e));
     s.on('close', () => finish(new Error('socks 连接被关闭')));

@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -11,7 +12,11 @@ const { DEFAULTS } = require('../src/config');
 const { Engine } = require('../src/engine');
 const { buildExport } = require('../src/exporter');
 const { Groups } = require('../src/groups');
+const { startHook } = require('../src/hook');
+const { startPanel } = require('../src/panel');
+const { Prober } = require('../src/prober');
 const { RuleWriter } = require('../src/rules');
+const { acceptSocks, reply, socksConnect } = require('../src/socks');
 const { Store } = require('../src/store');
 const { install, renderBlock } = require('../src/verge-script');
 
@@ -21,6 +26,48 @@ function tempDir(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoroute-regression-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
+}
+
+function ruleProviderFixture(dir, names) {
+  const counts = new Map(names.map((name) => [name, 1]));
+  const calls = [];
+  const stale = new Set();
+  const api = {
+    async get(endpoint) {
+      assert.equal(endpoint, '/providers/rules');
+      return { providers: Object.fromEntries([...counts].map(([name, ruleCount]) => [name, { ruleCount }])) };
+    },
+    async refreshRuleProvider(name) {
+      calls.push(name);
+      if (!stale.has(name)) counts.set(name, fileLines(name).length);
+    },
+  };
+  function fileLines(name) {
+    return fs.readFileSync(path.join(dir, 'autoroute', `${name.slice('autoroute-'.length)}.list`), 'utf8')
+      .split('\n').filter((line) => line && !line.startsWith('#'));
+  }
+  return { api, counts, calls, stale, fileLines };
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function socksListener(t, onRequest) {
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    acceptSocks(socket, onRequest);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    return new Promise((resolve) => server.close(resolve));
+  });
+  return server.address().port;
 }
 
 test('安装为新选中的代理组预建实际引用的规则文件', (t) => {
@@ -39,11 +86,130 @@ test('安装为新选中的代理组预建实际引用的规则文件', (t) => {
 
   const { file } = install(cfg, path.join(dir, 'backup'), rules);
   const applied = vm.runInNewContext(fs.readFileSync(file, 'utf8') + '\nmain(profile)', { profile });
-  const providers = Object.values(applied['rule-providers']);
-  assert.equal(providers.length, 1, '只为显式成员 B 创建规则集');
-  const providerFile = path.resolve(dir, providers[0].path);
-  assert(fs.existsSync(providerFile), '重新应用订阅前规则文件应已存在');
-  assert.match(fs.readFileSync(providerFile, 'utf8'), /autoroute-placeholder\.invalid/);
+  const providers = Object.entries(applied['rule-providers']);
+  assert.deepEqual([...applied.listeners.slice(1)].map((listener) => listener.proxy).sort(), ['B', 'DIRECT']);
+  assert.equal(providers.length, 2, '为显式成员 B 和手动直连准备规则集');
+  assert(!applied.rules.some((rule) => /^(GEOSITE|GEOIP),/.test(rule)), '没有地理数据时保持可加载');
+  for (const [name, provider] of providers) {
+    assert.equal(provider.type, 'http');
+    assert.equal(provider.proxy, 'DIRECT');
+    assert.equal(provider.url, `http://127.0.0.1:${cfg.panelPort}/api/rule-lists/${name}`);
+    assert.notEqual(path.resolve(dir, provider.path), rules.fileOfProvider(name), '内核缓存和规则源使用不同路径');
+    const file = rules.fileOfProvider(name);
+    assert(fs.existsSync(file), '重新应用订阅前规则文件应已存在');
+    assert.match(fs.readFileSync(file, 'utf8'), /autoroute-placeholder\.invalid/);
+  }
+});
+
+test('大陆直连排在原有规则之后和 AutoRoute 分配之前', (t) => {
+  const dir = tempDir(t);
+  const cfg = { ...DEFAULTS, targetGroup: 'Manual', vergeHome: dir };
+  const profile = {
+    'proxy-groups': [{ name: 'Manual', type: 'select', proxies: ['A'] }],
+    rules: ['DOMAIN,custom.cn,A', 'MATCH,Manual'],
+  };
+  fs.mkdirSync(path.join(dir, 'profiles'));
+  fs.writeFileSync(path.join(dir, 'clash-verge.yaml'), YAML.stringify(profile));
+  fs.writeFileSync(path.join(dir, 'geosite.dat'), 'geosite fixture');
+  fs.writeFileSync(path.join(dir, 'Country.mmdb'), 'mmdb fixture');
+  const writer = new RuleWriter(cfg, null, null, null, log);
+  const { file } = install(cfg, path.join(dir, 'backup'), writer);
+  const source = fs.readFileSync(file, 'utf8') + '\nmain(profile)';
+  const result = vm.runInNewContext(source, { profile: structuredClone(profile) });
+  assert.deepEqual([...result.rules.slice(0, 3)], [
+    'DOMAIN,custom.cn,A', 'GEOSITE,cn,AutoRoute-Direct', 'GEOIP,CN,AutoRoute-Direct',
+  ]);
+  assert(result.rules[3].startsWith('RULE-SET,autoroute-'));
+  assert.deepEqual([...result['proxy-groups'].find((group) => group.name === 'AutoRoute-Direct').proxies], ['DIRECT']);
+  assert.deepEqual(vm.runInNewContext(source, { profile: structuredClone(result) }).rules, result.rules);
+
+  fs.writeFileSync(path.join(dir, 'clash-verge.yaml'), YAML.stringify(result));
+  const exported = YAML.parse(buildExport(cfg, [{ domain: 'saved.example', node: 'DIRECT', state: 'locked' }]).yaml);
+  assert.deepEqual(exported.rules, ['DOMAIN,custom.cn,A', 'DOMAIN-SUFFIX,saved.example,DIRECT', 'MATCH,Manual']);
+});
+
+test('首连同时竞速两个代理和直连，最快的直连可以成为出口', async (t) => {
+  const dir = tempDir(t);
+  const cfg = { ...DEFAULTS, vergeHome: dir };
+  const store = new Store(dir);
+  t.after(() => { if (store.timer) clearTimeout(store.timer); });
+  const probes = [];
+  let complete;
+  const waitForAllToStart = new Promise((resolve) => { complete = resolve; });
+  const api = {
+    async get(endpoint) {
+      if (endpoint === '/configs') return { mode: 'rule' };
+      if (endpoint === '/proxies/AutoRoute-Fallback') return { all: ['AutoRoute-Hook', 'A'], now: 'AutoRoute-Hook' };
+      return { rules: [
+        { type: 'GeoSite', payload: 'cn', proxy: 'AutoRoute-Direct' },
+        { type: 'RuleSet', payload: 'autoroute-p7901-0123456789abcdef', proxy: 'A' },
+        { type: 'RuleSet', payload: 'autoroute-p7902-0123456789abcdef', proxy: 'B' },
+        { type: 'RuleSet', payload: 'autoroute-p7903-0123456789abcdef', proxy: 'AutoRoute-Direct' },
+        { type: 'Match', proxy: 'AutoRoute-Fallback' },
+      ] };
+    },
+    async delay(node) {
+      probes.push(node);
+      await waitForAllToStart;
+      return ({ A: 127, B: 178, DIRECT: 12 })[node];
+    },
+  };
+  const groups = new Groups(cfg, api, log);
+  await groups.refresh();
+  assert.deepEqual(groups.chinaRules, ['domain']);
+  const engine = new Engine({ cfg, groups, store, rules: { schedule() {} }, prober: new Prober(cfg, api), log });
+
+  const routing = engine.route('sample.example', 443);
+  const concurrent = engine.route('www.sample.example', 443);
+  try {
+    assert.deepEqual(probes, ['A', 'B', 'DIRECT']);
+  } finally {
+    complete();
+    await Promise.all([routing, concurrent]);
+  }
+  const [choice, otherChoice] = await Promise.all([routing, concurrent]);
+  assert.equal(choice.port, 7903);
+  assert.equal(otherChoice.port, 7903);
+  assert.equal(store.get('sample.example'), undefined, '准备转发时尚未保存');
+  otherChoice.finish(false);
+  assert.equal(store.get('sample.example'), undefined, '失败的并发连接不会抢先保存');
+  choice.finish(true);
+  assert.equal(store.get('sample.example').node, 'DIRECT');
+  assert.equal(store.get('sample.example').delays.DIRECT, 12);
+  assert.equal(engine.stats.assigned, 1);
+
+  engine.setNode('sample.example', 'A');
+  const compared = await engine.retest('sample.example', true);
+  assert.equal(compared.node, 'A', '重测保留用户锁定的出口');
+  assert.equal(store.get('sample.example').state, 'locked');
+  engine.setState('sample.example', 'auto');
+  assert.equal((await engine.retest('sample.example', true)).node, 'DIRECT');
+});
+
+test('近期旧自动记录重新比较直连一次，保留旧锁定记录', async (t) => {
+  const dir = tempDir(t);
+  const cfg = { ...DEFAULTS, vergeHome: dir };
+  const store = new Store(dir);
+  t.after(() => { if (store.timer) clearTimeout(store.timer); });
+  const now = Date.now();
+  store.set({ domain: 'old-auto.example', node: 'A', state: 'auto', testedAt: now, lastSeen: now,
+    delays: { A: 127, B: 178, DIRECT: 12 } }); // 旧版本的手动对照值
+  store.set({ domain: 'old-locked.example', node: 'A', state: 'locked', testedAt: now, lastSeen: now });
+  const groups = new Groups(cfg, null, log);
+  groups.mapping = new Map([['A', 7901], ['B', 7902], ['DIRECT', 7903]]);
+  let rounds = 0;
+  const prober = {
+    probe(host, port, nodes) {
+      rounds++;
+      return { all: Promise.resolve(Object.fromEntries(nodes.map((node) => [node, node === 'DIRECT' ? 12 : 127]))) };
+    },
+  };
+  const engine = new Engine({ cfg, groups, store, rules: { schedule() {} }, prober, log });
+  await engine.retestCycle();
+  assert.equal(store.get('old-auto.example').node, 'DIRECT');
+  assert.equal(store.get('old-locked.example').node, 'A');
+  await engine.retestCycle();
+  assert.equal(rounds, 1);
 });
 
 test('只含动态 provider 的代理组不会覆盖原扩展脚本', (t) => {
@@ -97,7 +263,7 @@ test('选到同一端口的新出口不会继承旧出口的规则内容', (t) =
     fs.writeFileSync(path.join(dir, 'clash-verge.yaml'), YAML.stringify(profile));
     const { file } = install(cfg, path.join(dir, 'backup'), rules);
     const applied = vm.runInNewContext(fs.readFileSync(file, 'utf8') + '\nmain(profile)', { profile: structuredClone(profile) });
-    return path.resolve(dir, Object.values(applied['rule-providers'])[0].path);
+    return rules.fileOfProvider(Object.keys(applied['rule-providers'])[0]);
   }
   const first = installFor('A');
   fs.appendFileSync(first, '+.only-on-a.example\n');
@@ -170,11 +336,16 @@ test('注入与导出尊重首条 MATCH 的位置和出口', (t) => {
 test('规则刷新失败后即使磁盘内容没变也会重试', async (t) => {
   const cfg = { ...DEFAULTS, vergeHome: tempDir(t) };
   const entries = [{ domain: 'example.com', node: 'A' }];
-  const providerCalls = [];
+  const core = ruleProviderFixture(cfg.vergeHome, ['autoroute-p7901']);
+  let rejected = false;
   const api = {
+    get: core.api.get,
     async refreshRuleProvider(name) {
-      providerCalls.push(name);
-      if (providerCalls.length === 1) throw new Error('内核暂时不可用');
+      if (!rejected) {
+        rejected = true;
+        throw new Error('内核暂时不可用');
+      }
+      await core.api.refreshRuleProvider(name);
     },
   };
   const groups = new Groups(cfg, api, log);
@@ -182,16 +353,86 @@ test('规则刷新失败后即使磁盘内容没变也会重试', async (t) => {
   const writer = new RuleWriter(cfg, api, { list: () => entries }, groups, log);
 
   await writer.flush();
+  assert.match(writer.lastError, /内核暂时不可用/);
   await writer.flush();
-  assert.deepEqual(providerCalls, ['autoroute-p7901', 'autoroute-p7901']);
+  assert.equal(writer.lastError, null);
+  assert.deepEqual(core.calls, ['autoroute-p7901']);
   assert.match(fs.readFileSync(path.join(cfg.vergeHome, 'autoroute', 'p7901.list'), 'utf8'), /\+\.example\.com/);
+});
+
+test('内核返回刷新成功但仍保留旧条数时，只重试未确认的规则集', async (t) => {
+  const cfg = { ...DEFAULTS, vergeHome: tempDir(t) };
+  const direct = 'autoroute-p7903';
+  const proxy = 'autoroute-p7901';
+  const core = ruleProviderFixture(cfg.vergeHome, [direct, proxy]);
+  core.stale.add(direct);
+  const groups = new Groups(cfg, core.api, log);
+  groups.mapping = new Map([['DIRECT', 7903], ['A', 7901]]);
+  const entries = [{ domain: 'china.example', node: 'DIRECT' }, { domain: 'other.example', node: 'A' }];
+  const writer = new RuleWriter(cfg, core.api, { list: () => entries }, groups, log);
+
+  assert.deepEqual(await writer.flush(), [proxy]);
+  assert.match(writer.lastError, /autoroute-p7903/);
+  assert.equal(core.counts.get(direct), 1);
+  const pending = core.fileLines(direct);
+  assert(pending.includes('+.china.example'));
+
+  core.stale.delete(direct);
+  assert.deepEqual(await writer.flush(), [direct]);
+  assert.deepEqual(core.fileLines(direct), pending);
+  assert.equal(writer.lastError, null);
+  assert.deepEqual(core.calls, [direct, proxy, direct]);
+
+  core.counts.set(direct, 1);
+  assert.deepEqual(await writer.flush(), [direct], '定期核对能够修复已确认过的规则集');
+  assert.equal(core.counts.get(direct), pending.length);
+});
+
+test('交换等量域名时能发现规则集仍使用前一版', async (t) => {
+  const cfg = { ...DEFAULTS, vergeHome: tempDir(t) };
+  const name = 'autoroute-p7903';
+  const core = ruleProviderFixture(cfg.vergeHome, [name]);
+  const groups = new Groups(cfg, core.api, log);
+  groups.mapping.set('DIRECT', 7903);
+  const entry = { domain: 'old.example', node: 'DIRECT' };
+  const writer = new RuleWriter(cfg, core.api, { list: () => [entry] }, groups, log);
+  await writer.flush();
+  const oldCount = core.counts.get(name);
+
+  entry.domain = 'new.example';
+  core.stale.add(name);
+  await writer.flush();
+  assert.notEqual(core.fileLines(name).length, oldCount);
+  assert.match(writer.lastError, /autoroute-p7903/);
+  assert(core.fileLines(name).includes('+.new.example'));
+});
+
+test('内核通过本机 HTTP 读取最新规则文件', async (t) => {
+  const cfg = { ...DEFAULTS, vergeHome: tempDir(t), panelPort: 0 };
+  const name = 'autoroute-p7901';
+  const core = ruleProviderFixture(cfg.vergeHome, [name]);
+  const groups = new Groups(cfg, core.api, log);
+  groups.mapping.set('A', 7901);
+  const store = { list: () => [{ domain: 'localhost-source.example', node: 'A' }] };
+  const rules = new RuleWriter(cfg, core.api, store, groups, log);
+  const panel = await startPanel({ cfg, store, rules, groups, api: core.api, log });
+  t.after(() => panel.close());
+  const root = `http://127.0.0.1:${panel.address().port}/api/rule-lists/`;
+  assert.equal((await fetch(root + name)).status, 404);
+
+  await rules.flush();
+  const source = await fetch(root + name);
+  assert.equal(source.status, 200);
+  assert.match(source.headers.get('content-type'), /^text\/plain/);
+  assert.match(await source.text(), /\+\.localhost-source\.example/);
+  assert.equal((await fetch(root + name, { headers: { Origin: 'http://outside.example' } })).status, 403);
 });
 
 test('已分配域名加入排除后停止下发和导出规则，保留锁定记录', async (t) => {
   const dir = tempDir(t);
   const cfg = { ...DEFAULTS, vergeHome: dir, exclude: ['example.com'] };
   const list = [{ domain: 'example.com', node: 'A', state: 'locked' }];
-  const api = { async refreshRuleProvider() {} };
+  const { api } = ruleProviderFixture(dir, ['autoroute-p7901']);
   const groups = new Groups(cfg, api, log);
   groups.mapping.set('A', 7901);
   const writer = new RuleWriter(cfg, api, { list: () => list }, groups, log);
@@ -244,4 +485,109 @@ test('首连测速返回时保留用户刚刚手动锁定的出口', async (t) =
   finishProbe({ node: 'A', delay: 35, delays: { A: 35, B: 80 } });
   assert.equal((await routing).node, 'B');
   assert.equal(store.get('example.com').state, 'locked');
+
+  const choice = await engine.route('next.example', 443);
+  engine.setNode('next.example', 'B');
+  choice.finish(true);
+  assert.equal(store.get('next.example').node, 'B', '握手等待期间的手动分配也优先');
+});
+
+async function checkFirstDialFallback(t, onFirstRequest) {
+  const directPort = await socksListener(t, onFirstRequest);
+  let fallbackConnections = 0;
+  const fallbackPort = await socksListener(t, (socket) => {
+    fallbackConnections++;
+    socket.write(reply(0x00));
+    socket.on('data', (data) => socket.write(data));
+    socket.resume();
+  });
+  const dir = tempDir(t);
+  const cfg = { ...DEFAULTS, vergeHome: dir, listenerBase: fallbackPort, hookPort: 0 };
+  const store = new Store(dir);
+  t.after(() => clearTimeout(store.timer));
+  const directProvider = `autoroute-p${directPort}`;
+  const core = ruleProviderFixture(dir, ['autoroute-p7901', 'autoroute-p7902', directProvider]);
+  const groups = new Groups(cfg, core.api, log);
+  groups.mapping = new Map([['A', 7901], ['B', 7902], ['DIRECT', directPort]]);
+  const rules = new RuleWriter(cfg, core.api, store, groups, log);
+  t.after(() => clearTimeout(rules.timer));
+  const prober = new Prober(cfg, { async delay(node) { return { A: 95, B: 120, DIRECT: 12 }[node]; } });
+  const engine = new Engine({ cfg, groups, store, rules, prober, log });
+  const hook = await startHook(cfg, engine, log);
+  t.after(() => hook.server.close());
+
+  const client = await socksConnect(hook.server.address().port, 'retry.example', 443, 1500);
+  try {
+    const echoed = new Promise((resolve) => client.once('data', resolve));
+    client.write('hello');
+    client.resume();
+    assert.equal(String(await echoed), 'hello');
+  } finally {
+    client.destroy();
+  }
+  assert.equal(fallbackConnections, 1);
+  assert.equal(store.get('retry.example'), undefined);
+  assert.equal(engine.stats.assigned, 0);
+  await rules.flush();
+  assert(!core.fileLines(directProvider).includes('+.retry.example'));
+}
+
+test('首选握手拒绝时原兜底转发，本次失败不会写入域名规则', async (t) => {
+  await checkFirstDialFallback(t, (socket) => socket.end(reply(0x05)));
+});
+
+test('首选握手超时会及时尝试原兜底', async (t) => {
+  await checkFirstDialFallback(t, () => {});
+});
+
+test('迟到的后台复测不会覆盖手动直连结果，重复手动请求共用测速', async (t) => {
+  const dir = tempDir(t);
+  const cfg = { ...DEFAULTS, vergeHome: dir };
+  const store = new Store(dir);
+  t.after(() => clearTimeout(store.timer));
+  const domain = 'manual.example';
+  store.set({ domain, node: 'A', state: 'auto', testedAt: 0, lastSeen: Date.now() });
+  const groups = new Groups(cfg, null, log);
+  groups.mapping = new Map([['A', 7901], ['B', 7902], ['DIRECT', 7903]]);
+  const background = deferred();
+  const manual = deferred();
+  let rounds = 0;
+  const prober = { probe: () => ({ all: ++rounds === 1 ? background.promise : manual.promise }) };
+  const engine = new Engine({ cfg, groups, store, rules: { schedule() {} }, prober, log });
+
+  const cycle = engine.retestCycle();
+  const first = engine.retest(domain, true);
+  const second = engine.retest(domain, true);
+  manual.resolve({ A: 95, B: 123, DIRECT: 12 });
+  await Promise.all([first, second]);
+  const expected = structuredClone(store.get(domain));
+  assert.equal(expected.node, 'DIRECT');
+  background.resolve({ A: 80, B: 120, DIRECT: null });
+  await cycle;
+  assert.deepEqual(store.get(domain), expected);
+  assert.equal(rounds, 2);
+});
+
+test('首连其余测速结果不能覆盖已开始的手动重测', async (t) => {
+  const dir = tempDir(t);
+  const cfg = { ...DEFAULTS, vergeHome: dir };
+  const store = new Store(dir);
+  t.after(() => clearTimeout(store.timer));
+  const groups = new Groups(cfg, null, log);
+  groups.mapping = new Map([['A', 7901], ['B', 7902], ['DIRECT', 7903]]);
+  const tail = deferred();
+  const manual = deferred();
+  const prober = { probe: (host, port, nodes, race) => race ? {
+    decision: Promise.resolve({ node: 'A', delay: 95, delays: { A: 95 } }), all: tail.promise,
+  } : { all: manual.promise } };
+  const engine = new Engine({ cfg, groups, store, rules: { schedule() {} }, prober, log });
+  const choice = await engine.route('tail.example', 443);
+  choice.finish(true);
+
+  const retest = engine.retest('tail.example', true);
+  tail.resolve({ A: 95, B: 130, DIRECT: 6 });
+  await tail.promise;
+  assert.deepEqual(store.get('tail.example').delays, { A: 95 });
+  manual.resolve({ A: 47, B: 140, DIRECT: 120 });
+  assert.equal((await retest).node, 'A');
 });
